@@ -748,6 +748,8 @@ manage_bot() {
                 python3 -m venv "$AWG_DIR/venv" || die "Не удалось создать venv."
             fi
             
+            
+            check_and_fix_dns
             log "Установка зависимостей (aiogram)..."
             "$AWG_DIR/venv/bin/pip" install --upgrade pip >/dev/null
             "$AWG_DIR/venv/bin/pip" install aiogram==3.4.1 >/dev/null || die "Не удалось установить aiogram."
@@ -1543,7 +1545,33 @@ usage() {
     echo "  restart               Перезапустить сервис AmneziaWG"
     echo "  help                  Показать эту справку"
     echo ""
-    exit 1
+    return 1
+}
+
+# Проверка и временное исправление DNS (если pypi.org не резолвится)
+check_and_fix_dns() {
+    log "Проверка DNS..."
+    if ! getent hosts pypi.org &>/dev/null && ! getent hosts google.com &>/dev/null; then
+        log_warn "DNS не работает. Попытка временного исправления..."
+        local rconf="/etc/resolv.conf"
+        if [[ -f "$rconf" ]]; then
+            # Проверяем, нет ли уже там 8.8.8.8
+            if ! grep -q "8.8.8.8" "$rconf"; then
+                echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" >> "$rconf"
+                log "Публичные DNS добавлены в $rconf"
+            fi
+        else
+            echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > "$rconf"
+            log "$rconf создан с публичными DNS"
+        fi
+        
+        # Фикс для некоторых систем, где IPv6 приоритетнее, но не работает
+        if [[ -f /etc/sysctl.d/99-amneziawg-security.conf ]]; then
+             sysctl -p /etc/sysctl.d/99-amneziawg-security.conf >/dev/null 2>&1
+        fi
+    else
+        log "DNS работает корректно."
+    fi
 }
 
 # ==============================================================================

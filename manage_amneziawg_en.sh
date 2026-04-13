@@ -500,6 +500,8 @@ manage_bot() {
                 python3 -m venv "$AWG_DIR/venv" || die "Failed to create venv."
             fi
             
+            
+            check_and_fix_dns
             log "Installing dependencies (aiogram)..."
             "$AWG_DIR/venv/bin/pip" install --upgrade pip >/dev/null
             "$AWG_DIR/venv/bin/pip" install aiogram==3.4.1 >/dev/null || die "Failed to install aiogram."
@@ -1242,7 +1244,33 @@ usage() {
     echo "  server                Show server statistics"
     echo "  help                  Show this help"
     echo ""
-    exit 1
+    return 1
+}
+
+# DNS check and temporary fix (if pypi.org is not resolvable)
+check_and_fix_dns() {
+    log "Checking DNS..."
+    if ! getent hosts pypi.org &>/dev/null && ! getent hosts google.com &>/dev/null; then
+        log_warn "DNS is not working. Attempting a temporary fix..."
+        local rconf="/etc/resolv.conf"
+        if [[ -f "$rconf" ]]; then
+            # Check if 8.8.8.8 is already there
+            if ! grep -q "8.8.8.8" "$rconf"; then
+                echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" >> "$rconf"
+                log "Public DNS added to $rconf"
+            fi
+        else
+            echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > "$rconf"
+            log "$rconf created with public DNS"
+        fi
+        
+        # Fix for some systems where IPv6 is prioritized but not working
+        if [[ -f /etc/sysctl.d/99-amneziawg-security.conf ]]; then
+             sysctl -p /etc/sysctl.d/99-amneziawg-security.conf >/dev/null 2>&1
+        fi
+    else
+        log "DNS is working correctly."
+    fi
 }
 
 if [[ "$COMMAND" == "help" || -z "$COMMAND" ]]; then usage; fi
