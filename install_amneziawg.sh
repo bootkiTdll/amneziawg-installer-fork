@@ -1,0 +1,1872 @@
+#!/bin/bash
+
+# Проверка минимальной версии Bash
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "ОШИБКА: Требуется Bash >= 4.0 (текущая: ${BASH_VERSION})" >&2; exit 1
+fi
+
+# ==============================================================================
+# Скрипт для установки и настройки AmneziaWG 2.0 на Ubuntu/Debian серверах
+# Автор: @bivlked
+# Версия: 5.8.0
+# Дата: 2026-04-07
+# Репозиторий: https://github.com/bootkiTdll/amneziawg-installer-fork
+# ==============================================================================
+
+# --- Безопасный режим и Константы ---
+set -o pipefail
+
+SCRIPT_VERSION="5.8.0"
+AWG_DIR="/root/awg"
+CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
+STATE_FILE="$AWG_DIR/setup_state"
+LOG_FILE="$AWG_DIR/install_amneziawg.log"
+KEYS_DIR="$AWG_DIR/keys"
+SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
+AWG_BRANCH="${AWG_BRANCH:-main}"
+COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bootkiTdll/amneziawg-installer-fork/${AWG_BRANCH}/awg_common.sh"
+COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
+MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bootkiTdll/amneziawg-installer-fork/${AWG_BRANCH}/manage_amneziawg.sh"
+MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
+
+# Флаги CLI
+UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+_APT_UPDATED=0
+CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
+CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
+
+# --- Автоочистка временных файлов ---
+_install_temp_files=()
+_install_cleanup() {
+    local f
+    for f in "${_install_temp_files[@]}"; do [[ -f "$f" ]] && rm -f "$f"; done
+    # Очистка временных файлов из awg_common.sh (если уже подключён через source)
+    type _awg_cleanup &>/dev/null && _awg_cleanup
+}
+trap _install_cleanup EXIT INT TERM
+
+# --- Обработка аргументов ---
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --uninstall)     UNINSTALL=1 ;;
+        --help|-h)       HELP=1 ;;
+        --diagnostic)    DIAGNOSTIC=1 ;;
+        --verbose|-v)    VERBOSE=1 ;;
+        --no-color)      NO_COLOR=1 ;;
+        --port=*)        CLI_PORT="${1#*=}" ;;
+        --subnet=*)      CLI_SUBNET="${1#*=}" ;;
+        --allow-ipv6)    CLI_DISABLE_IPV6=0 ;;
+        --disallow-ipv6) CLI_DISABLE_IPV6=1 ;;
+        --route-all)     CLI_ROUTING_MODE=1 ;;
+        --route-amnezia) CLI_ROUTING_MODE=2 ;;
+        --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
+        --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
+        --yes|-y)        AUTO_YES=1 ;;
+        --no-tweaks)     NO_TWEAKS=1; CLI_NO_TWEAKS=1 ;;
+        *) echo "Неизвестный аргумент: $1"; HELP=1 ;;
+    esac
+    shift
+done
+
+# ==============================================================================
+# Функции логирования
+# ==============================================================================
+
+log_msg() {
+    local type="$1" msg="$2"
+    local ts
+    ts=$(date +'%F %T')
+    local safe_msg
+    safe_msg="${msg//%/%%}"
+    local entry="[$ts] $type: $safe_msg"
+    local color_start="" color_end=""
+
+    if [[ "$NO_COLOR" -eq 0 ]]; then
+        color_end="\033[0m"
+        case "$type" in
+            INFO)  color_start="\033[0;32m" ;;
+            WARN)  color_start="\033[0;33m" ;;
+            ERROR) color_start="\033[1;31m" ;;
+            DEBUG) color_start="\033[0;36m" ;;
+            *)     color_start=""; color_end="" ;;
+        esac
+    fi
+
+    if ! mkdir -p "$(dirname "$LOG_FILE")" || ! echo "$entry" >> "$LOG_FILE"; then
+        echo "[$ts] ERROR: Ошибка записи лога $LOG_FILE" >&2
+    fi
+
+    if [[ "$type" == "ERROR" || "$type" == "WARN" ]]; then
+        printf "${color_start}%s${color_end}\n" "$entry" >&2
+    elif [[ "$type" == "DEBUG" && "$VERBOSE" -eq 1 ]]; then
+        printf "${color_start}%s${color_end}\n" "$entry" >&2
+    elif [[ "$type" == "INFO" ]]; then
+        printf "${color_start}%s${color_end}\n" "$entry"
+    elif [[ "$type" != "DEBUG" ]]; then
+        printf "${color_start}%s${color_end}\n" "$entry"
+    fi
+}
+
+log()       { log_msg "INFO" "$1"; }
+log_warn()  { log_msg "WARN" "$1"; }
+log_error() { log_msg "ERROR" "$1"; }
+log_debug() { if [[ "$VERBOSE" -eq 1 ]]; then log_msg "DEBUG" "$1"; fi; }
+die()       { log_error "КРИТИЧЕСКАЯ ОШИБКА: $1"; log_error "Установка прервана. Лог: $LOG_FILE"; exit 1; }
+
+# ==============================================================================
+# Справка
+# ==============================================================================
+
+show_help() {
+    cat << 'EOF'
+Использование: sudo bash install_amneziawg.sh [ОПЦИИ]
+Скрипт для установки и настройки AmneziaWG 2.0 на Ubuntu (24.04 / 25.10) и Debian (12 / 13).
+
+Опции:
+  -h, --help            Показать эту справку и выйти
+  --uninstall           Удалить AmneziaWG и все его конфигурации
+  --diagnostic          Создать диагностический отчет и выйти
+  -v, --verbose         Расширенный вывод для отладки (включая DEBUG)
+  --no-color            Отключить цветной вывод в терминале
+  --port=НОМЕР          Установить UDP порт (1024-65535) неинтерактивно
+  --subnet=ПОДСЕТЬ      Установить подсеть туннеля (x.x.x.x/yy) неинтерактивно
+  --allow-ipv6          Оставить IPv6 включенным неинтерактивно
+  --disallow-ipv6       Принудительно отключить IPv6 неинтерактивно
+  --route-all           Использовать режим 'Весь трафик' неинтерактивно
+  --route-amnezia       Использовать режим 'Amnezia' неинтерактивно
+  --route-custom=СЕТИ   Использовать режим 'Пользовательский' неинтерактивно
+  --endpoint=IP         Указать внешний IP сервера (для серверов за NAT)
+  -y, --yes             Автоматическое подтверждение (перезагрузки, UFW и т.д.)
+  --no-tweaks           Пропустить hardening/оптимизацию (без UFW, Fail2Ban, sysctl tweaks)
+
+Примеры:
+  sudo bash install_amneziawg.sh                             # Интерактивная установка
+  sudo bash install_amneziawg.sh --port=51820 --route-all    # Неинтерактивная
+  sudo bash install_amneziawg.sh --route-amnezia --yes       # Полностью автоматическая
+  sudo bash install_amneziawg.sh --uninstall                 # Удаление
+  sudo bash install_amneziawg.sh --diagnostic                # Диагностика
+
+Репозиторий: https://github.com/bootkiTdll/amneziawg-installer-fork
+EOF
+    exit 0
+}
+
+# ==============================================================================
+# Утилиты и валидация
+# ==============================================================================
+
+update_state() {
+    local next_step=$1
+    mkdir -p "$(dirname "$STATE_FILE")"
+    # Атомарная запись с flock для предотвращения race condition
+    (
+        flock -x 200
+        echo "$next_step" > "$STATE_FILE"
+    ) 200>"${STATE_FILE}.lock" || die "Ошибка записи состояния"
+    log "Состояние: следующий шаг - $next_step"
+}
+
+request_reboot() {
+    local next_step=$1
+    update_state "$next_step"
+    echo "" >> "$LOG_FILE"
+    log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    log_warn "!!! ТРЕБУЕТСЯ ПЕРЕЗАГРУЗКА СИСТЕМЫ                        !!!"
+    log_warn "!!! После перезагрузки, запустите скрипт снова командой:   !!!"
+    log_warn "!!! sudo bash $0 [с теми же параметрами, если были]       !!!"
+    log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "" >> "$LOG_FILE"
+    local confirm="y"
+    if [[ "$AUTO_YES" -eq 0 ]]; then
+        read -rp "Перезагрузить сейчас? [y/N]: " confirm < /dev/tty
+    else
+        log "Автоматическое подтверждение перезагрузки (--yes)."
+    fi
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        log "Инициирована перезагрузка..."
+        sleep 5
+        if ! reboot; then die "Команда reboot не удалась."; fi
+        exit 1
+    else
+        log "Перезагрузка отменена. Перезагрузитесь вручную и запустите скрипт снова."
+        exit 1
+    fi
+}
+
+check_os_version() {
+    log "Проверка ОС..."
+
+    # Определение через /etc/os-release (универсально для Ubuntu и Debian)
+    OS_ID=""
+    OS_VERSION=""
+    OS_CODENAME=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
+        OS_CODENAME="$VERSION_CODENAME"
+    elif command -v lsb_release &>/dev/null; then
+        OS_ID=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
+        OS_VERSION=$(lsb_release -sr)
+        OS_CODENAME=$(lsb_release -sc)
+    else
+        log_warn "Не удалось определить ОС (/etc/os-release и lsb_release не найдены)."
+        return 0
+    fi
+    export OS_ID OS_VERSION OS_CODENAME
+
+    # Поддерживаемые ОС
+    local supported=0
+    case "$OS_ID" in
+        ubuntu)
+            if [[ "$OS_VERSION" == "24.04" || "$OS_VERSION" == "25.10" ]]; then
+                supported=1
+            fi
+            ;;
+        debian)
+            if [[ "$OS_VERSION" == "12" || "$OS_VERSION" == "13" ]]; then
+                supported=1
+            fi
+            ;;
+    esac
+
+    if [[ "$supported" -eq 1 ]]; then
+        log "ОС: ${OS_ID^} $OS_VERSION ($OS_CODENAME) — поддерживается"
+    else
+        log_warn "Обнаружена $OS_ID $OS_VERSION ($OS_CODENAME). Скрипт протестирован на Ubuntu 24.04/25.10 и Debian 12/13."
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            read -rp "Продолжить? [y/N]: " confirm < /dev/tty
+            if ! [[ "$confirm" =~ ^[Yy]$ ]]; then die "Отмена."; fi
+        else
+            log "Продолжаем на $OS_ID $OS_VERSION (--yes)."
+        fi
+    fi
+}
+
+check_free_space() {
+    log "Проверка места..."
+    local req=2048
+    local avail
+    avail=$(df -m / | awk 'NR==2 {print $4}')
+    if [[ -z "$avail" ]]; then
+        log_warn "Не удалось определить свободное место."
+        return 0
+    fi
+    if [ "$avail" -lt "$req" ]; then
+        log_warn "Доступно $avail МБ. Рекомендуется >= $req МБ."
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            read -rp "Продолжить? [y/N]: " confirm < /dev/tty
+            if ! [[ "$confirm" =~ ^[Yy]$ ]]; then die "Отмена."; fi
+        else
+            log "Продолжаем с $avail МБ (--yes)."
+        fi
+    else
+        log "Свободно: $avail МБ (OK)"
+    fi
+}
+
+check_port_availability() {
+    local port=$1
+    log "Проверка порта $port..."
+    local proc
+    proc=$(ss -lunp | grep ":${port} ")
+    if [[ -n "$proc" ]]; then
+        log_error "Порт ${port}/udp уже используется! Процесс: $proc"
+        return 1
+    else
+        log "Порт $port/udp свободен."
+        return 0
+    fi
+}
+
+install_packages() {
+    local packages=("$@")
+    local to_install=()
+    local pkg
+    log "Проверка пакетов: ${packages[*]}..."
+    for pkg in "${packages[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            to_install+=("$pkg")
+        fi
+    done
+    if [ ${#to_install[@]} -eq 0 ]; then
+        log "Все пакеты уже установлены."
+        return 0
+    fi
+    log "Установка: ${to_install[*]}..."
+    if [[ "${_APT_UPDATED:-0}" -eq 0 ]]; then
+        apt update -y || log_warn "Не удалось обновить apt."
+        _APT_UPDATED=1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt install -y "${to_install[@]}" || die "Ошибка установки пакетов."
+    log "Пакеты установлены."
+}
+
+cleanup_apt() {
+    log "Очистка apt..."
+    apt-get clean || log_warn "Ошибка apt-get clean"
+    rm -rf /var/lib/apt/lists/* || log_warn "Ошибка rm /var/lib/apt/lists/*"
+    log "Кэш apt очищен."
+}
+
+configure_ipv6() {
+    if [[ "$CLI_DISABLE_IPV6" != "default" ]]; then
+        DISABLE_IPV6=$CLI_DISABLE_IPV6
+        log "IPv6 из CLI: $DISABLE_IPV6"
+    elif [[ "$AUTO_YES" -eq 1 ]]; then
+        DISABLE_IPV6=1
+        log "IPv6 отключен (--yes, по умолчанию)."
+    else
+        read -rp "Отключить IPv6 (рекомендуется)? [Y/n]: " dis_ipv6 < /dev/tty
+        if [[ "$dis_ipv6" =~ ^[Nn]$ ]]; then
+            DISABLE_IPV6=0
+        else
+            DISABLE_IPV6=1
+        fi
+    fi
+    export DISABLE_IPV6
+    log "Отключение IPv6: $(if [ "$DISABLE_IPV6" -eq 1 ]; then echo 'Да'; else echo 'Нет'; fi)"
+}
+
+# Безопасная загрузка конфигурации (whitelist-парсер, без source/eval)
+safe_load_config() {
+    local config_file="${1:-$CONFIG_FILE}"
+    if [[ ! -f "$config_file" ]]; then return 1; fi
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        line="${line#export }"
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ "$value" == \'*\' ]]; then
+                value="${value#\'}"
+                value="${value%\'}"
+            elif [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
+            fi
+            case "$key" in
+                OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|NO_TWEAKS|AWG_APPLY_MODE)
+                    export "$key=$value"
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+}
+
+# Чтение одного ключа из конфига (для точечных запросов)
+safe_read_config_key() {
+    local key="$1" config_file="${2:-$CONFIG_FILE}"
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#export }"
+        if [[ "$line" =~ ^${key}=(.*)$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ "$value" == \'*\' ]]; then
+                value="${value#\'}"
+                value="${value%\'}"
+            elif [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
+            fi
+            echo "$value"
+            return 0
+        fi
+    done < "$config_file"
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1024 ]] || [[ "$port" -gt 65535 ]]; then
+        die "Некорректный порт: '$port'. Допустимый диапазон: 1024-65535."
+    fi
+}
+
+validate_subnet() {
+    local subnet="$1"
+    if ! [[ "$subnet" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
+       || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+       || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
+        die "Некорректная подсеть: '$subnet'. Поддерживается только /24."
+    fi
+    if [[ "${BASH_REMATCH[4]}" -eq 0 ]] || [[ "${BASH_REMATCH[4]}" -eq 255 ]]; then
+        die "Некорректная подсеть: '$subnet'. Последний октет не может быть 0 (сетевой адрес) или 255 (broadcast)."
+    fi
+    if [[ "${BASH_REMATCH[4]}" -ne 1 ]]; then
+        die "Некорректная подсеть: '$subnet'. Последний октет должен быть 1 (адрес сервера в подсети)."
+    fi
+}
+
+# Валидация endpoint (FQDN / IPv4 / [IPv6]).
+# Возвращает 0 если endpoint безопасен и попадает под один из форматов,
+# иначе 1 (caller сам решает die или log_warn + unset).
+# Запрещает newline/CR/quotes/backslash чтобы предотвратить injection в
+# awgsetup_cfg.init и client.conf через --endpoint флаг (audit).
+validate_endpoint() {
+    local ep="$1"
+    [[ -n "$ep" ]] || return 1
+    # Запрещаем символы которые могут сломать конфиг или внести injection
+    [[ "$ep" != *$'\n'* && "$ep" != *$'\r'* && \
+       "$ep" != *"'"* && "$ep" != *'"'* && "$ep" != *'\\'* && \
+       "$ep" != *' '* && "$ep" != *$'\t'* ]] || return 1
+    # Один из трёх форматов: FQDN, IPv4, [IPv6]
+    [[ "$ep" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*|[0-9]{1,3}(\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\])$ ]] || return 1
+    return 0
+}
+
+validate_cidr_list() {
+    local input="$1" cidr
+    IFS=',' read -ra cidrs <<< "$input"
+    for cidr in "${cidrs[@]}"; do
+        cidr=$(echo "$cidr" | tr -d ' ')
+        if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] \
+           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[5]}" -gt 32 ]]; then
+            return 1
+        fi
+    done
+}
+
+configure_routing_mode() {
+    if [[ "$CLI_ROUTING_MODE" != "default" ]]; then
+        ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
+        if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then
+            ALLOWED_IPS=$CLI_CUSTOM_ROUTES
+            if [ -z "$ALLOWED_IPS" ]; then die "Не указаны сети для --route-custom."; fi
+        fi
+        log "Режим маршрутизации из CLI: $ALLOWED_IPS_MODE"
+    elif [[ "$AUTO_YES" -eq 1 ]]; then
+        ALLOWED_IPS_MODE=2
+        log "Режим маршрутизации: Amnezia+DNS (--yes, по умолчанию)."
+    else
+        echo ""
+        log "Выберите режим маршрутизации (AllowedIPs клиента):"
+        echo "  1) Весь трафик (0.0.0.0/0) - Макс. приватность, может блокировать LAN"
+        echo "  2) Список Amnezia+DNS (умолч.) - Рекомендуется для обхода блокировок"
+        echo "  3) Только указанные сети (Split Tunneling)"
+        read -rp "Ваш выбор [2]: " r_mode < /dev/tty
+        ALLOWED_IPS_MODE=${r_mode:-2}
+    fi
+    case "$ALLOWED_IPS_MODE" in
+        1) ALLOWED_IPS="0.0.0.0/0"
+           log "Выбран режим: Весь трафик." ;;
+        3) if [[ -z "$CLI_CUSTOM_ROUTES" ]]; then
+               read -rp "Введите сети (a.b.c.d/xx,...): " ALLOWED_IPS < /dev/tty
+               while ! validate_cidr_list "$ALLOWED_IPS"; do
+                   log_warn "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
+                   read -rp "Повторите ввод: " ALLOWED_IPS < /dev/tty
+               done
+           else
+               ALLOWED_IPS=$CLI_CUSTOM_ROUTES
+               if ! validate_cidr_list "$ALLOWED_IPS"; then
+                   die "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
+               fi
+           fi
+           log "Выбран режим: Пользовательский ($ALLOWED_IPS)" ;;
+        *) ALLOWED_IPS_MODE=2
+           ALLOWED_IPS="0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 8.8.8.8/32, 1.1.1.1/32"
+           log "Выбран режим: Список Amnezia+DNS." ;;
+    esac
+    if [ -z "$ALLOWED_IPS" ]; then die "Не удалось определить AllowedIPs."; fi
+    export ALLOWED_IPS_MODE ALLOWED_IPS
+}
+
+# ==============================================================================
+# Генерация AWG 2.0 параметров (inline — нужны в шаге 0, до скачивания awg_common.sh)
+# ==============================================================================
+
+# Случайное число [min, max] через /dev/urandom (поддержка uint32)
+rand_range() {
+    local min=$1 max=$2
+    local range=$((max - min + 1))
+    local random_val
+    random_val=$(od -An -tu4 -N4 /dev/urandom | tr -d ' ')
+    if [[ -z "$random_val" || ! "$random_val" =~ ^[0-9]+$ ]]; then
+        # Fallback: комбинация двух $RANDOM для 30-битного диапазона
+        random_val=$(( (RANDOM << 15) | RANDOM ))
+    fi
+    echo $(( (random_val % range) + min ))
+}
+
+# Генерация 4 непересекающихся uint32 диапазонов для AWG H1-H4.
+# Алгоритм: 8 случайных uint32 значений → sort → 4 пары (low, high).
+# Сортировка гарантирует low ≤ high и непересечение между парами.
+# Минимальная ширина каждого диапазона = 1000 (для нормальной обфускации).
+# Печатает 4 строки формата "low-high" в stdout.
+# Возвращает 1 если за 20 попыток не удалось получить корректные диапазоны.
+#
+# Оптимизация: один вызов `od -N32 -tu4` читает 32 байта = 8 uint32 значений
+# одной операцией, вместо 8 отдельных subprocess через rand_range.
+# Fallback на rand_range если /dev/urandom недоступен.
+generate_awg_h_ranges() {
+    local attempt=0 max_attempts=20
+    while (( attempt < max_attempts )); do
+        local raw arr=() _v
+        raw=$(od -An -N32 -tu4 /dev/urandom 2>/dev/null | tr -s ' \n' '\n' | sed '/^$/d')
+        if [[ -n "$raw" ]]; then
+            local count=0
+            while IFS= read -r _v; do
+                [[ "$_v" =~ ^[0-9]+$ ]] || continue
+                arr+=("$_v"); count=$((count + 1))
+                (( count == 8 )) && break
+            done <<< "$raw"
+        fi
+        if (( ${#arr[@]} != 8 )); then
+            arr=()
+            local _i
+            for _i in 1 2 3 4 5 6 7 8; do
+                arr+=("$(rand_range 0 4294967295)")
+            done
+        fi
+        local sorted
+        sorted=$(printf '%s\n' "${arr[@]}" | sort -n)
+        arr=()
+        while IFS= read -r _v; do arr+=("$_v"); done <<< "$sorted"
+        if (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
+           (( ${arr[3]} - ${arr[2]} >= 1000 )) && \
+           (( ${arr[5]} - ${arr[4]} >= 1000 )) && \
+           (( ${arr[7]} - ${arr[6]} >= 1000 )); then
+            printf '%s-%s\n' "${arr[0]}" "${arr[1]}"
+            printf '%s-%s\n' "${arr[2]}" "${arr[3]}"
+            printf '%s-%s\n' "${arr[4]}" "${arr[5]}"
+            printf '%s-%s\n' "${arr[6]}" "${arr[7]}"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# Генерация CPS строки для I1
+# Формат: "<r N>" где N — количество случайных байт (32-256)
+generate_cps_i1() {
+    local n
+    n=$(rand_range 32 256)
+    echo "<r ${n}>"
+}
+
+# Генерация всех AWG 2.0 параметров
+generate_awg_params() {
+    log "Генерация параметров AWG 2.0..."
+
+    AWG_Jc=$(rand_range 4 8)
+    AWG_Jmin=$(rand_range 40 89)
+    AWG_Jmax=$(( AWG_Jmin + $(rand_range 100 500) ))
+    AWG_S1=$(rand_range 15 150)
+    AWG_S2=$(rand_range 15 150)
+
+    # Критическое ограничение из kernel: S1+56 != S2
+    # Предотвращает одинаковый размер init и response сообщений
+    while [[ $((AWG_S1 + 56)) -eq $AWG_S2 ]]; do
+        AWG_S2=$(rand_range 15 150)
+    done
+
+    AWG_S3=$(rand_range 8 55)
+    AWG_S4=$(rand_range 4 27)
+
+    # H1-H4: 4 случайных непересекающихся uint32 диапазона.
+    # Рандомизация на каждую установку защищает от ТСПУ-фингерпринта
+    # по статическим H-значениям (Discussion #38, elvaleto/Klavishnik).
+    # Алгоритм: 8 случайных uint32 → sort → 4 непересекающиеся пары.
+    local _h_ranges
+    _h_ranges=$(generate_awg_h_ranges) || die "Не удалось сгенерировать H1-H4 диапазоны."
+    AWG_H1=$(echo "$_h_ranges" | sed -n '1p')
+    AWG_H2=$(echo "$_h_ranges" | sed -n '2p')
+    AWG_H3=$(echo "$_h_ranges" | sed -n '3p')
+    AWG_H4=$(echo "$_h_ranges" | sed -n '4p')
+
+    # I1: CPS concealment
+    AWG_I1=$(generate_cps_i1)
+
+    export AWG_Jc AWG_Jmin AWG_Jmax AWG_S1 AWG_S2 AWG_S3 AWG_S4
+    export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1
+
+    log "  Jc=$AWG_Jc, Jmin=$AWG_Jmin, Jmax=$AWG_Jmax"
+    log "  S1=$AWG_S1, S2=$AWG_S2, S3=$AWG_S3, S4=$AWG_S4"
+    log "  H1=$AWG_H1"
+    log "  H2=$AWG_H2"
+    log "  H3=$AWG_H3"
+    log "  H4=$AWG_H4"
+    log "  I1=$AWG_I1"
+    log "Параметры AWG 2.0 сгенерированы."
+}
+
+# ==============================================================================
+# Системная оптимизация (новое в v5.0)
+# ==============================================================================
+
+# Определение характеристик железа
+detect_hardware() {
+    TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
+    CPU_CORES=$(nproc)
+    MAIN_NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    log "Железо: RAM=${TOTAL_RAM_MB}MB, CPU=${CPU_CORES} ядер, NIC=${MAIN_NIC}"
+}
+
+# Удаление ненужных пакетов и сервисов
+cleanup_system() {
+    log "Очистка системы от ненужных компонентов..."
+
+    # Пакеты для удаления (безопасные для VPS)
+    # snapd и lxd-agent-loader — только на Ubuntu, на Debian их нет
+    local packages_to_remove=()
+    local pkg
+    local cleanup_list="modemmanager networkd-dispatcher unattended-upgrades packagekit udisks2"
+    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
+        cleanup_list="snapd $cleanup_list lxd-agent-loader"
+    fi
+    for pkg in $cleanup_list; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            packages_to_remove+=("$pkg")
+        fi
+    done
+
+    if [ ${#packages_to_remove[@]} -gt 0 ]; then
+        log "Удаление: ${packages_to_remove[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages_to_remove[@]}" || log_warn "Ошибка удаления некоторых пакетов"
+    fi
+
+    # Очистка snap артефактов (только Ubuntu)
+    if [[ "${OS_ID:-ubuntu}" == "ubuntu" && -d /snap ]]; then
+        log "Очистка snap артефактов..."
+        rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || log_warn "Ошибка очистки snap"
+    fi
+
+    # cloud-init: удалять только если НЕ управляет сетью
+    # Консервативный подход: сначала проверяем маркеры cloud-init, затем renderer
+    if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null | grep -q "ok installed"; then
+        local cloud_manages_network=0
+        # Проверяем маркеры cloud-init (приоритет — безопасность)
+        if ls /etc/netplan/*cloud-init* &>/dev/null 2>&1; then
+            cloud_manages_network=1
+        elif grep -rq "cloud-init" /etc/netplan/ 2>/dev/null; then
+            cloud_manages_network=1
+        elif [[ -f /etc/network/interfaces ]] && grep -q "cloud-init" /etc/network/interfaces 2>/dev/null; then
+            cloud_manages_network=1
+        fi
+        if [[ $cloud_manages_network -eq 0 ]]; then
+            log "Удаление cloud-init (сеть не зависит от него)..."
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y cloud-init 2>/dev/null || log_warn "Ошибка удаления cloud-init"
+            rm -rf /etc/cloud /var/lib/cloud 2>/dev/null
+        else
+            log_warn "cloud-init управляет сетью — пропускаем удаление."
+        fi
+    fi
+
+    apt-get autoremove -y 2>/dev/null || log_warn "Ошибка autoremove"
+    log "Очистка системы завершена."
+}
+
+# Настройка swap
+optimize_swap() {
+    log "Оптимизация swap..."
+    local target_swap_mb
+
+    if [[ $TOTAL_RAM_MB -le 2048 ]]; then
+        target_swap_mb=1024
+    else
+        target_swap_mb=512
+    fi
+
+    # Проверяем текущий swap
+    local current_swap_mb
+    current_swap_mb=$(free -m | awk '/Swap:/ {print $2}')
+
+    if [[ $current_swap_mb -ge $target_swap_mb ]]; then
+        log "Swap уже достаточен: ${current_swap_mb}MB (цель: ${target_swap_mb}MB)"
+    else
+        log "Создание swap файла: ${target_swap_mb}MB"
+        # Отключаем существующий swap файл если есть
+        if [[ -f /swapfile ]]; then
+            swapoff /swapfile 2>/dev/null
+            rm -f /swapfile
+        fi
+        dd if=/dev/zero of=/swapfile bs=1M count="$target_swap_mb" status=none 2>/dev/null || {
+            log_warn "Ошибка создания swap файла"
+            return 1
+        }
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1 || { log_warn "Ошибка mkswap"; return 1; }
+        swapon /swapfile || { log_warn "Ошибка swapon"; return 1; }
+        # Добавляем в fstab если отсутствует
+        if ! grep -q '/swapfile' /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        log "Swap файл создан: ${target_swap_mb}MB"
+    fi
+
+    # Настройка swappiness
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1
+}
+
+# Оптимизация сетевого интерфейса
+optimize_nic() {
+    if [[ -z "$MAIN_NIC" ]]; then
+        log_warn "Основной NIC не определён, пропуск оптимизации."
+        return 1
+    fi
+
+    if ! command -v ethtool &>/dev/null; then
+        log_debug "ethtool не найден, пропуск NIC оптимизации."
+        return 0
+    fi
+
+    log "Оптимизация NIC: $MAIN_NIC"
+    # Отключение GRO/GSO/TSO — могут мешать VPN-трафику
+    ethtool -K "$MAIN_NIC" gro off 2>/dev/null || log_debug "GRO: не поддерживается/уже выкл."
+    ethtool -K "$MAIN_NIC" gso off 2>/dev/null || log_debug "GSO: не поддерживается/уже выкл."
+    ethtool -K "$MAIN_NIC" tso off 2>/dev/null || log_debug "TSO: не поддерживается/уже выкл."
+    log "NIC оптимизация завершена."
+}
+
+# Полная оптимизация системы
+optimize_system() {
+    log "Оптимизация системы под VPN-сервер..."
+    detect_hardware
+    optimize_swap
+    optimize_nic
+    log "Оптимизация системы завершена."
+}
+
+# ==============================================================================
+# Настройка sysctl (минимальная, для --no-tweaks)
+# ==============================================================================
+
+setup_minimal_sysctl() {
+    log "Настройка минимального sysctl (--no-tweaks)..."
+    local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
+    cat > "$f" << SYSEOF
+# AmneziaWG — минимальные настройки (--no-tweaks)
+net.ipv4.ip_forward = 1
+SYSEOF
+    if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+SYSEOF
+    else
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.forwarding = 1
+SYSEOF
+    fi
+    sysctl -p "$f" >/dev/null 2>&1 || log_warn "Ошибка sysctl -p"
+    log "Минимальный sysctl настроен."
+}
+
+# ==============================================================================
+# Настройка sysctl (расширенная)
+# ==============================================================================
+
+setup_advanced_sysctl() {
+    log "Настройка sysctl..."
+    local f="/etc/sysctl.d/99-amneziawg-security.conf"
+
+    # Адаптивные буферы по объёму RAM
+    local rmem_max wmem_max netdev_backlog
+    if [[ ${TOTAL_RAM_MB:-1024} -ge 2048 ]]; then
+        rmem_max=16777216    # 16MB
+        wmem_max=16777216
+        netdev_backlog=5000
+    else
+        rmem_max=4194304     # 4MB
+        wmem_max=4194304
+        netdev_backlog=2500
+    fi
+
+    cat > "$f" << EOF
+# AmneziaWG 2.0 Security/Performance Settings - $(date)
+# Автоматически сгенерировано install_amneziawg.sh v${SCRIPT_VERSION}
+
+# --- IP Forwarding ---
+net.ipv4.ip_forward = 1
+$(if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+    echo "net.ipv6.conf.all.disable_ipv6 = 1"
+    echo "net.ipv6.conf.default.disable_ipv6 = 1"
+    echo "net.ipv6.conf.lo.disable_ipv6 = 1"
+else
+    echo "# IPv6 не отключен"
+    echo "net.ipv6.conf.all.forwarding = 1"
+fi)
+
+# --- TCP/IP Hardening ---
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+net.ipv4.tcp_rfc1337 = 1
+
+# --- Redirects ---
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+$(if [[ "${DISABLE_IPV6:-1}" -ne 1 ]]; then
+    echo "net.ipv6.conf.all.accept_redirects = 0"
+    echo "net.ipv6.conf.default.accept_redirects = 0"
+fi)
+
+# --- BBR Congestion Control ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- Network Buffers (adaptive) ---
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${wmem_max}
+net.core.netdev_max_backlog = ${netdev_backlog}
+
+# --- Conntrack ---
+net.netfilter.nf_conntrack_max = 65536
+
+# --- Security ---
+vm.swappiness = 10
+kernel.sysrq = 0
+EOF
+
+    log "Применение sysctl..."
+    if ! sysctl -p "$f" >/dev/null 2>&1; then
+        # nf_conntrack может быть недоступен до загрузки модуля
+        log_warn "Некоторые параметры sysctl не применились (nf_conntrack будет доступен позже)."
+        sysctl -p "$f" 2>/dev/null || true
+    fi
+}
+
+# ==============================================================================
+# Фаервол и безопасность
+# ==============================================================================
+
+setup_improved_firewall() {
+    log "Настройка UFW..."
+    if ! command -v ufw &>/dev/null; then install_packages ufw; fi
+
+    # Определяем основной сетевой интерфейс для правила маршрутизации
+    local main_nic
+    main_nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    if [[ -z "$main_nic" ]]; then
+        log_warn "Не удалось определить сетевой интерфейс для UFW route."
+    fi
+
+    if ufw status | grep -q inactive; then
+        log "UFW неактивен. Настройка..."
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw limit 22/tcp comment "SSH Rate Limit"
+        ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+            log "Правило маршрутизации VPN добавлено (awg0 → ${main_nic})."
+        fi
+        log "Правила UFW добавлены."
+        log_warn "--- ВКЛЮЧЕНИЕ UFW ---"
+        log_warn "Проверьте SSH доступ!"
+        local confirm_ufw="y"
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            sleep 5
+            read -rp "Включить UFW? [y/N]: " confirm_ufw < /dev/tty
+        else
+            log "Автоматическое включение UFW (--yes)."
+        fi
+        if ! [[ "$confirm_ufw" =~ ^[Yy]$ ]]; then
+            log_warn "UFW не включен."
+            return 1
+        fi
+        if ! ufw enable <<< "y"; then die "Ошибка включения UFW."; fi
+        log "UFW включен."
+        # Маркер: UFW был включён нашим установщиком (а не пользователем заранее).
+        # Используется в step_uninstall чтобы решить, безопасно ли отключать UFW.
+        # Защита от destructive uninstall на VPS где UFW использовался для SSH/web
+        # hardening ДО установки нашего скрипта (audit).
+        touch "$AWG_DIR/.ufw_enabled_by_installer" 2>/dev/null || \
+            log_warn "Не удалось создать UFW marker — uninstall не сможет отключить UFW автоматически."
+    else
+        log "UFW активен. Обновление правил..."
+        ufw limit 22/tcp comment "SSH Rate Limit"
+        ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+        fi
+        ufw reload || log_warn "Ошибка перезагрузки UFW."
+        log "Правила обновлены."
+    fi
+    log "UFW настроен."
+    log "$(ufw status verbose 2>&1)"
+    return 0
+}
+
+secure_files() {
+    log "Установка безопасных прав доступа..."
+    chmod 700 "$AWG_DIR" 2>/dev/null
+    chmod 700 /etc/amnezia 2>/dev/null
+    chmod 700 /etc/amnezia/amneziawg 2>/dev/null
+    chmod 600 /etc/amnezia/amneziawg/*.conf 2>/dev/null
+    find "$AWG_DIR" -name "*.conf" -type f -exec chmod 600 {} \; 2>/dev/null
+    find "$AWG_DIR" -name "*.key" -type f -exec chmod 600 {} \; 2>/dev/null
+    find "$AWG_DIR" -name "*.png" -type f -exec chmod 600 {} \; 2>/dev/null
+    if [[ -d "$KEYS_DIR" ]]; then
+        chmod 700 "$KEYS_DIR" 2>/dev/null
+        chmod 600 "$KEYS_DIR"/* 2>/dev/null
+    fi
+    [[ -f "$CONFIG_FILE" ]] && chmod 600 "$CONFIG_FILE"
+    [[ -f "$LOG_FILE" ]] && chmod 640 "$LOG_FILE"
+    [[ -f "$MANAGE_SCRIPT_PATH" ]] && chmod 700 "$MANAGE_SCRIPT_PATH"
+    [[ -f "$COMMON_SCRIPT_PATH" ]] && chmod 700 "$COMMON_SCRIPT_PATH"
+    log "Права доступа установлены."
+}
+
+setup_fail2ban() {
+    log "Настройка Fail2Ban..."
+    if ! command -v fail2ban-client &>/dev/null; then install_packages fail2ban; fi
+    if ! command -v fail2ban-client &>/dev/null; then
+        log_warn "Fail2ban не установлен, пропускаем."
+        return 1
+    fi
+
+    # Debian: journald вместо rsyslog, нужен python3-systemd
+    if [[ "${OS_ID:-}" == "debian" ]]; then
+        install_packages python3-systemd
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d 2>/dev/null
+
+    # Backend: systemd для Debian (нет rsyslog), auto для Ubuntu
+    local f2b_backend="auto"
+    if [[ "${OS_ID:-}" == "debian" ]]; then
+        f2b_backend="systemd"
+    fi
+
+    cat > /etc/fail2ban/jail.d/amneziawg.conf << JAILEOF || { log_warn "Ошибка записи jail.d/amneziawg.conf"; return 1; }
+# AmneziaWG — SSH protection (managed by amneziawg-installer)
+[sshd]
+enabled = true
+backend = ${f2b_backend}
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+banaction = ufw
+JAILEOF
+
+    if systemctl restart fail2ban; then
+        log "Fail2Ban настроен и перезапущен."
+    else
+        log_warn "Ошибка перезапуска fail2ban"
+    fi
+    return 0
+}
+
+# ==============================================================================
+# Проверка статуса сервиса
+# ==============================================================================
+
+check_service_status() {
+    log "Проверка статуса сервиса..."
+    local ok=1
+
+    if systemctl is-failed --quiet awg-quick@awg0; then
+        log_error "Сервис FAILED!"
+        ok=0
+    fi
+
+    if ! ip addr show awg0 &>/dev/null; then
+        log_error "Интерфейс awg0 не найден!"
+        ok=0
+    fi
+
+    if ! awg show 2>/dev/null | grep -q "interface: awg0"; then
+        log_error "awg show не видит интерфейс!"
+        ok=0
+    fi
+
+    # Проверка порта
+    local port_check=${AWG_PORT:-0}
+    if [[ "$port_check" -eq 0 ]] && [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        port_check=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
+        port_check=${port_check:-0}
+    fi
+    if [[ "$port_check" -ne 0 ]]; then
+        if ! ss -lunp | grep -q ":${port_check} "; then
+            log_error "Порт $port_check/udp не прослушивается!"
+            ok=0
+        fi
+    fi
+
+    # Проверка AWG 2.0 параметров
+    if awg show awg0 2>/dev/null | grep -q "jc:"; then
+        log "AWG 2.0 параметры активны."
+    else
+        log_warn "AWG 2.0 параметры не обнаружены в awg show."
+    fi
+
+    if [[ "$ok" -eq 1 ]]; then
+        log "Статус сервиса и интерфейса OK."
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ==============================================================================
+# Диагностика
+# ==============================================================================
+
+create_diagnostic_report() {
+    log "Создание диагностики..."
+    local rf
+    rf="$AWG_DIR/diag_$(date +%F_%T).txt"
+    {
+        echo "=== AMNEZIAWG 2.0 DIAGNOSTIC REPORT ==="
+        echo "Generated: $(date)"
+        echo "Hostname: $(hostname)"
+        echo "Installer: v${SCRIPT_VERSION}"
+        echo ""
+        echo "--- OS ---"
+        lsb_release -ds 2>/dev/null || cat /etc/os-release
+        uname -a
+        echo ""
+        echo "--- Hardware ---"
+        echo "RAM: $(awk '/MemTotal/ {printf "%.0f MB", $2/1024}' /proc/meminfo)"
+        echo "CPU: $(nproc) cores"
+        echo "Swap: $(free -m | awk '/Swap:/ {print $2}') MB"
+        echo ""
+        echo "--- Configuration ($CONFIG_FILE) ---"
+        cat "$CONFIG_FILE" 2>/dev/null || echo "File not found"
+        echo ""
+        echo "--- Server Config ($SERVER_CONF_FILE) ---"
+        # Маскируем приватный ключ
+        if [[ -f "$SERVER_CONF_FILE" ]]; then
+            sed 's/PrivateKey = .*/PrivateKey = [HIDDEN]/' "$SERVER_CONF_FILE"
+        else
+            echo "File not found"
+        fi
+        echo ""
+        echo "--- Service Status ---"
+        systemctl status awg-quick@awg0 --no-pager -l 2>/dev/null || echo "Service not found"
+        echo ""
+        echo "--- AWG Status ---"
+        awg show 2>/dev/null || echo "awg show failed"
+        echo ""
+        echo "--- AWG Version ---"
+        awg --version 2>/dev/null || echo "awg --version failed"
+        echo ""
+        echo "--- Network Interfaces ---"
+        ip a 2>/dev/null
+        echo ""
+        echo "--- Listening Ports ---"
+        ss -lunp 2>/dev/null
+        echo ""
+        echo "--- Firewall Status ---"
+        if command -v ufw &>/dev/null; then ufw status verbose; else echo "UFW N/A"; fi
+        echo ""
+        echo "--- Routing Table ---"
+        ip route 2>/dev/null
+        echo ""
+        echo "--- Kernel Params ---"
+        sysctl net.ipv4.ip_forward net.ipv6.conf.all.disable_ipv6 2>/dev/null
+        echo ""
+        echo "--- AWG Journal (last 50) ---"
+        journalctl -u awg-quick@awg0 -n 50 --no-pager --output=cat 2>/dev/null || echo "N/A"
+        echo ""
+        echo "--- Client List ---"
+        grep "^#_Name = " "$SERVER_CONF_FILE" 2>/dev/null | sed 's/^#_Name = //' || echo "N/A"
+        echo ""
+        echo "--- DKMS Status ---"
+        dkms status 2>/dev/null || echo "N/A"
+        echo ""
+        echo "--- Module Info ---"
+        modinfo amneziawg 2>/dev/null || echo "N/A"
+        echo ""
+        echo "=== END ==="
+    } > "$rf" || log_error "Ошибка записи отчета."
+    chmod 600 "$rf" || log_warn "Ошибка chmod отчета."
+    log "Отчет: $rf"
+}
+
+# ==============================================================================
+# Деинсталляция
+# ==============================================================================
+
+step_uninstall() {
+    log "### ДЕИНСТАЛЛЯЦИЯ AMNEZIAWG ###"
+    echo ""
+    echo "ВНИМАНИЕ! Полное удаление AmneziaWG и конфигураций."
+    echo "Процесс необратим!"
+    echo ""
+    local confirm="" backup="Y"
+    if [[ "$AUTO_YES" -eq 0 ]]; then
+        read -rp "Уверены? (введите 'yes'): " confirm < /dev/tty
+        if [[ "$confirm" != "yes" ]]; then log "Деинсталляция отменена."; exit 1; fi
+        read -rp "Создать бэкап перед удалением? [Y/n]: " backup < /dev/tty
+    else
+        log "Автоматическое подтверждение деинсталляции (--yes)."
+    fi
+    if [[ -z "$backup" || "$backup" =~ ^[Yy]$ ]]; then
+        local bf
+        bf="$HOME/awg_uninstall_backup_$(date +%F_%H-%M-%S).tar.gz"
+        log "Создание бэкапа: $bf"
+        tar -czf "$bf" -C / etc/amnezia "$AWG_DIR" --ignore-failed-read 2>/dev/null || log_warn "Ошибка создания бэкапа $bf"
+        chmod 600 "$bf" || log_warn "Ошибка chmod бэкапа"
+        log "Бэкап создан: $bf"
+    fi
+    # Загружаем флаг --no-tweaks из сохранённой конфигурации
+    local saved_no_tweaks=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        saved_no_tweaks=$(safe_read_config_key "NO_TWEAKS" "$CONFIG_FILE" 2>/dev/null) || saved_no_tweaks=0
+        saved_no_tweaks=${saved_no_tweaks:-0}
+    fi
+    log "Остановка сервиса..."
+    systemctl stop awg-quick@awg0 2>/dev/null
+    systemctl disable awg-quick@awg0 2>/dev/null
+    modprobe -r amneziawg 2>/dev/null || true
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        log "Очистка правил UFW для AmneziaWG..."
+        if command -v ufw &>/dev/null; then
+            local port_to_del
+            if [[ -f "$CONFIG_FILE" ]]; then
+                # shellcheck source=/dev/null
+                port_to_del=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
+            fi
+            port_to_del=${port_to_del:-39743}
+            # Удаление наших правил выполняется ВСЕГДА (idempotent)
+            ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            ufw route delete allow in on awg0 2>/dev/null
+
+            # ufw disable выполняется ТОЛЬКО если UFW был включён нашим установщиком.
+            # Защита от destructive uninstall на VPS где UFW использовался для
+            # SSH/web hardening ДО установки нашего скрипта (audit).
+            # Backwards compat: старые установки без маркера сохраняют UFW активным.
+            if [[ -f "$AWG_DIR/.ufw_enabled_by_installer" ]]; then
+                log "Отключение UFW (был включён нашим установщиком)..."
+                ufw --force disable 2>/dev/null
+                rm -f "$AWG_DIR/.ufw_enabled_by_installer"
+            else
+                log "UFW оставлен активным (использовался до установки или старая версия инсталлятора)."
+            fi
+        fi
+        log "Снятие блокировок Fail2Ban..."
+        if command -v fail2ban-client &>/dev/null; then
+            fail2ban-client unban --all 2>/dev/null || true
+            systemctl stop fail2ban 2>/dev/null
+        fi
+    else
+        log "Пропуск UFW/Fail2Ban (установка с --no-tweaks)."
+    fi
+    log "Удаление пакетов..."
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Ошибка purge."
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools qrencode 2>/dev/null || log_warn "Ошибка purge."
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || log_warn "Ошибка autoremove."
+    log "Удаление PPA и файлов..."
+    rm -f /etc/apt/sources.list.d/amnezia-ppa.sources \
+        /etc/apt/sources.list.d/amnezia-ppa.list \
+        /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.list \
+        /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.sources \
+        /etc/apt/keyrings/amnezia-ppa.gpg 2>/dev/null
+    rm -rf /etc/amnezia \
+        /etc/modules-load.d/amneziawg.conf \
+        /etc/sysctl.d/99-amneziawg-security.conf \
+        /etc/sysctl.d/99-amneziawg-forwarding.conf \
+        /etc/logrotate.d/amneziawg* || log_warn "Ошибка удаления файлов."
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        # Удаляем только наш собственный jail-файл.
+        # Раньше здесь была эвристика "если jail.local содержит banaction = ufw,
+        # удалить весь файл" — слишком широкий фильтр, мог снести чужой
+        # jail.local с custom jails. Эвристика убрана (audit).
+        # Если у юзера остался jail.local от очень старых версий нашего
+        # инсталлятора — пусть сам решает что с ним делать.
+        rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
+    fi
+    log "Удаление DKMS..."
+    rm -rf /var/lib/dkms/amneziawg* || log_warn "Ошибка удаления DKMS."
+    log "Восстановление sysctl..."
+    if grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+        sed -i '/disable_ipv6/d' /etc/sysctl.conf || log_warn "Ошибка sed sysctl.conf"
+    fi
+    sysctl -p --system 2>/dev/null
+    rm -f /etc/apt/sources.list.d/*.bak-* "$AWG_DIR"/ubuntu.sources.bak-* 2>/dev/null || true
+    log "Удаление cron и скриптов..."
+    rm -f /etc/cron.d/awg-expiry 2>/dev/null
+    log "=== ДЕИНСТАЛЛЯЦИЯ ЗАВЕРШЕНА ==="
+    # Копируем лог и удаляем рабочую директорию
+    cp "$LOG_FILE" "$HOME/awg_uninstall.log" 2>/dev/null || true
+    rm -rf "$AWG_DIR" 2>/dev/null || true
+    exit 0
+}
+
+# ==============================================================================
+# ШАГ 0: Инициализация
+# ==============================================================================
+
+initialize_setup() {
+    mkdir -p "$AWG_DIR" || die "Ошибка создания $AWG_DIR"
+    chown root:root "$AWG_DIR"
+
+    # Process-wide lock: предотвращает запуск двух экземпляров install_amneziawg.sh
+    # одновременно. Без него два concurrent запуска могли бы прочитать одинаковый
+    # setup_state, конкурентно дёргать apt-get/dkms/ufw и сломать package state
+    # (audit).
+    # FD выбран фиксированным (9) и не конфликтует с update_state (использует 200).
+    # Lock держится открытым весь lifetime процесса — release автоматически на exit.
+    INSTALL_LOCK_FILE="$AWG_DIR/.install.lock"
+    exec 9>"$INSTALL_LOCK_FILE" || die "Не могу открыть $INSTALL_LOCK_FILE"
+    if ! flock -n 9; then
+        die "Другой экземпляр install_amneziawg.sh уже запущен. Подождите завершения, либо если процесс висит — удалите $INSTALL_LOCK_FILE и попробуйте снова."
+    fi
+
+    touch "$LOG_FILE" || die "Не удалось создать лог-файл $LOG_FILE"
+    chmod 640 "$LOG_FILE"
+    log "--- НАЧАЛО УСТАНОВКИ AmneziaWG 2.0 (v${SCRIPT_VERSION}) ---"
+    log "### ШАГ 0: Инициализация и проверка параметров ###"
+    if [ "$(id -u)" -ne 0 ]; then die "Запустите скрипт от root (sudo bash $0)."; fi
+    cd "$AWG_DIR" || die "Ошибка перехода в $AWG_DIR"
+    log "Рабочая директория: $AWG_DIR"
+    log "Лог файл: $LOG_FILE"
+
+    check_os_version
+    check_free_space
+
+    local default_port=39743
+    local default_subnet="10.9.9.1/24"
+    local config_exists=0
+
+    # Инициализация переменных
+    AWG_PORT=$default_port
+    AWG_TUNNEL_SUBNET=$default_subnet
+    DISABLE_IPV6="default"
+    ALLOWED_IPS_MODE="default"
+    ALLOWED_IPS=""
+    AWG_ENDPOINT=""
+
+    # Загрузка конфига
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log "Найден файл конфигурации $CONFIG_FILE. Загрузка настроек..."
+        config_exists=1
+        # shellcheck source=/dev/null
+        safe_load_config "$CONFIG_FILE" || log_warn "Не удалось полностью загрузить настройки из $CONFIG_FILE."
+        AWG_PORT=${AWG_PORT:-$default_port}
+        AWG_TUNNEL_SUBNET=${AWG_TUNNEL_SUBNET:-$default_subnet}
+        DISABLE_IPV6=${DISABLE_IPV6:-"default"}
+        ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE:-"default"}
+        ALLOWED_IPS=${ALLOWED_IPS:-""}
+        AWG_ENDPOINT=${AWG_ENDPOINT:-""}
+        log "Настройки из файла загружены."
+    else
+        log "Файл конфигурации $CONFIG_FILE не найден."
+    fi
+
+    # Переопределение из CLI
+    AWG_PORT=${CLI_PORT:-$AWG_PORT}
+    AWG_TUNNEL_SUBNET=${CLI_SUBNET:-$AWG_TUNNEL_SUBNET}
+    if [[ "$CLI_DISABLE_IPV6" != "default" ]]; then DISABLE_IPV6=$CLI_DISABLE_IPV6; fi
+    if [[ "$CLI_ROUTING_MODE" != "default" ]]; then
+        ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
+        if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then ALLOWED_IPS=$CLI_CUSTOM_ROUTES; fi
+    fi
+    if [[ -n "$CLI_ENDPOINT" ]]; then
+        if ! validate_endpoint "$CLI_ENDPOINT"; then
+            die "Некорректный --endpoint: '$CLI_ENDPOINT'. Допустимые форматы: FQDN (vpn.example.com), IPv4 (1.2.3.4), [IPv6] ([2001:db8::1]). Запрещены пробелы, табы, кавычки, обратный слеш и переводы строк."
+        fi
+        AWG_ENDPOINT=$CLI_ENDPOINT
+    fi
+    if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
+
+    # Валидация после CLI override
+    validate_port "$AWG_PORT"
+    validate_subnet "$AWG_TUNNEL_SUBNET"
+    # AWG_ENDPOINT мог прийти из CONFIG_FILE через safe_load_config (без CLI override).
+    # Если значение есть и не валидно — log_warn + сброс в "" чтобы инсталлятор
+    # вернулся к auto-detect через get_server_public_ip (audit).
+    if [[ -n "$AWG_ENDPOINT" ]] && ! validate_endpoint "$AWG_ENDPOINT"; then
+        log_warn "AWG_ENDPOINT='$AWG_ENDPOINT' из $CONFIG_FILE не валиден, использую auto-detect."
+        AWG_ENDPOINT=""
+    fi
+
+    # Запрос у пользователя только на первом запуске
+    if [[ "$config_exists" -eq 0 ]]; then
+        log "Запрос настроек у пользователя (первый запуск)."
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            read -rp "Введите UDP порт AmneziaWG (1024-65535) [${AWG_PORT}]: " input_port < /dev/tty
+            if [[ -n "$input_port" ]]; then AWG_PORT=$input_port; fi
+        fi
+        validate_port "$AWG_PORT"
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            read -rp "Введите подсеть туннеля [${AWG_TUNNEL_SUBNET}]: " input_subnet < /dev/tty
+            if [[ -n "$input_subnet" ]]; then AWG_TUNNEL_SUBNET=$input_subnet; fi
+        fi
+        validate_subnet "$AWG_TUNNEL_SUBNET"
+        if [[ "$DISABLE_IPV6" == "default" ]]; then configure_ipv6; fi
+        if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then configure_routing_mode; fi
+    else
+        log "Используются настройки из $CONFIG_FILE."
+        if [[ "$ALLOWED_IPS_MODE" == "3" ]] && [[ -n "$ALLOWED_IPS" ]]; then
+            if ! validate_cidr_list "$ALLOWED_IPS"; then
+                die "Некорректный ALLOWED_IPS в конфиге: '$ALLOWED_IPS'. Удалите $CONFIG_FILE и запустите установку заново."
+            fi
+        fi
+    fi
+
+    # Значения по умолчанию
+    if [[ "$DISABLE_IPV6" == "default" ]]; then DISABLE_IPV6=1; fi
+    if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then ALLOWED_IPS_MODE=2; fi
+    if [[ -z "$ALLOWED_IPS" ]]; then configure_routing_mode; fi
+
+    # Проверка порта (пропускаем если AWG-сервис уже слушает этот порт)
+    if ! systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
+        check_port_availability "$AWG_PORT" || die "Порт $AWG_PORT/udp занят."
+    else
+        log "Сервис AWG активен — пропуск проверки порта."
+    fi
+
+    # Генерация AWG 2.0 параметров (только на первом запуске)
+    if [[ -z "${AWG_Jc:-}" ]]; then
+        generate_awg_params
+    else
+        log "AWG 2.0 параметры уже заданы из конфига."
+    fi
+
+    # Сохранение конфигурации
+    log "Сохранение настроек в $CONFIG_FILE..."
+    local temp_conf
+    temp_conf=$(mktemp) || die "Ошибка mktemp."
+    _install_temp_files+=("$temp_conf")
+    cat > "$temp_conf" << EOF
+# Конфигурация установки AmneziaWG 2.0 (Авто-генерация)
+# Используется скриптами установки и управления
+export OS_ID='${OS_ID:-ubuntu}'
+export OS_VERSION='${OS_VERSION:-}'
+export OS_CODENAME='${OS_CODENAME:-}'
+export AWG_PORT=${AWG_PORT}
+export AWG_TUNNEL_SUBNET='${AWG_TUNNEL_SUBNET}'
+export DISABLE_IPV6=${DISABLE_IPV6}
+export ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE}
+export ALLOWED_IPS='$(echo "$ALLOWED_IPS" | sed 's/\\,/,/g')'
+export AWG_ENDPOINT='${AWG_ENDPOINT}'
+# AWG 2.0 Parameters
+export AWG_Jc=${AWG_Jc}
+export AWG_Jmin=${AWG_Jmin}
+export AWG_Jmax=${AWG_Jmax}
+export AWG_S1=${AWG_S1}
+export AWG_S2=${AWG_S2}
+export AWG_S3=${AWG_S3}
+export AWG_S4=${AWG_S4}
+export AWG_H1='${AWG_H1}'
+export AWG_H2='${AWG_H2}'
+export AWG_H3='${AWG_H3}'
+export AWG_H4='${AWG_H4}'
+export AWG_I1='${AWG_I1}'
+export NO_TWEAKS=${NO_TWEAKS}
+export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'
+EOF
+    if ! mv "$temp_conf" "$CONFIG_FILE"; then
+        rm -f "$temp_conf"
+        die "Ошибка сохранения $CONFIG_FILE"
+    fi
+    chmod 600 "$CONFIG_FILE" || log_warn "Ошибка chmod $CONFIG_FILE"
+    log "Настройки сохранены."
+    export AWG_PORT AWG_TUNNEL_SUBNET DISABLE_IPV6 ALLOWED_IPS_MODE ALLOWED_IPS AWG_ENDPOINT
+    log "Порт: ${AWG_PORT}/udp"
+    log "Подсеть: ${AWG_TUNNEL_SUBNET}"
+    log "Откл. IPv6: $DISABLE_IPV6"
+    log "Режим AllowedIPs: $ALLOWED_IPS_MODE"
+
+    # Загрузка состояния
+    if [[ -f "$STATE_FILE" ]]; then
+        current_step=$(cat "$STATE_FILE")
+        if ! [[ "$current_step" =~ ^[0-9]+$ ]]; then
+            log_warn "$STATE_FILE поврежден."
+            current_step=1
+            update_state 1
+        else
+            log "Продолжение с шага $current_step."
+        fi
+    else
+        current_step=1
+        log "Начало с шага 1."
+        update_state 1
+    fi
+    log "Шаг 0 завершен."
+}
+
+# ==============================================================================
+# ШАГ 1: Обновление системы, очистка и оптимизация
+# ==============================================================================
+
+step1_update_and_optimize() {
+    update_state 1
+    log "### ШАГ 1: Обновление, очистка и оптимизация системы ###"
+
+    # Очистка ненужных компонентов (ДО обновления для экономии трафика/времени)
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        cleanup_system
+    else
+        log "Пропуск очистки системы (--no-tweaks)."
+    fi
+
+    log "Обновление списка пакетов..."
+    apt update -y || die "Ошибка apt update."
+
+    log "Разблокировка dpkg..."
+    if ! apt-get check &>/dev/null; then
+        log_warn "dpkg заблокирован или повреждён, исправление..."
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || log_warn "dpkg --configure -a."
+    fi
+
+    log "Обновление системы..."
+    DEBIAN_FRONTEND=noninteractive apt full-upgrade -y || die "Ошибка apt full-upgrade."
+    log "Система обновлена."
+
+    install_packages curl wget gpg sudo ethtool
+
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        # Оптимизация системы
+        optimize_system
+        # Настройка sysctl
+        setup_advanced_sysctl
+    else
+        log "Пропуск оптимизации и hardening (--no-tweaks)."
+        setup_minimal_sysctl
+    fi
+
+    log "Шаг 1 успешно завершен."
+    request_reboot 2
+}
+
+# ==============================================================================
+# ШАГ 2: Установка AmneziaWG и зависимостей
+# ==============================================================================
+
+step2_install_amnezia() {
+    update_state 2
+    log "### ШАГ 2: Установка AmneziaWG и зависимостей ###"
+    _APT_UPDATED=0  # Reset: new sources will be added in this step
+
+    # Включение deb-src (только Ubuntu — Ubuntu использует ubuntu.sources)
+    local sources_file="/etc/apt/sources.list.d/ubuntu.sources"
+    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
+        log "Проверка/включение deb-src..."
+        if [[ -f "$sources_file" ]]; then
+            if grep -q "^Types: deb$" "$sources_file"; then
+                log "Включение deb-src..."
+                local bak
+                bak="${AWG_DIR}/ubuntu.sources.bak-$(date +%F_%H%M%S)"
+                cp "$sources_file" "$bak" || log_warn "Ошибка бэкапа"
+                local tmp_sed
+                tmp_sed=$(mktemp)
+                _install_temp_files+=("$tmp_sed")
+                sed '/^Types: deb$/s/Types: deb/Types: deb deb-src/' "$sources_file" > "$tmp_sed" || {
+                    rm -f "$tmp_sed"; die "Ошибка sed."
+                }
+                if ! mv "$tmp_sed" "$sources_file"; then
+                    rm -f "$tmp_sed"; die "Ошибка mv $sources_file"
+                fi
+                apt update -y || die "Ошибка apt update."
+            else
+                apt update -y
+            fi
+        else
+            log_warn "$sources_file не найден, пропуск deb-src."
+            apt update -y
+        fi
+    else
+        # Debian: deb-src обычно уже настроен или не нужен для нашей задачи
+        log "Debian: пропуск настройки deb-src."
+        apt update -y
+    fi
+
+    # PPA Amnezia (без software-properties-common)
+    log "Добавление PPA Amnezia..."
+
+    # Определение codename для PPA
+    # На Debian маппим на ближайший Ubuntu codename, т.к. PPA — это Launchpad (Ubuntu)
+    # Debian 12 (bookworm) → focal, Debian 13 (trixie) → noble
+    local codename ppa_codename
+    codename="${OS_CODENAME:-$(lsb_release -sc 2>/dev/null || echo "noble")}"
+    case "${OS_ID:-ubuntu}" in
+        debian)
+            case "$codename" in
+                bookworm) ppa_codename="focal" ;;
+                trixie)   ppa_codename="noble" ;;
+                *)        ppa_codename="noble" ;;
+            esac
+            log "Debian ($codename) → PPA codename: $ppa_codename"
+            ;;
+        *)
+            ppa_codename="$codename"
+            ;;
+    esac
+
+    local keyring_dir="/etc/apt/keyrings"
+    local keyring_file="${keyring_dir}/amnezia-ppa.gpg"
+    local ppa_sources="/etc/apt/sources.list.d/amnezia-ppa.sources"
+    local ppa_list="/etc/apt/sources.list.d/amnezia-ppa.list"
+    # Проверка на legacy-файлы (от add-apt-repository предыдущих версий)
+    local legacy_list="/etc/apt/sources.list.d/amnezia-ubuntu-ppa-${codename}.list"
+    local legacy_sources="/etc/apt/sources.list.d/amnezia-ubuntu-ppa-${codename}.sources"
+    if [[ -f "$legacy_list" ]] || [[ -f "$legacy_sources" ]]; then
+        log "PPA уже добавлен (legacy-формат)."
+    elif [[ -f "$ppa_sources" ]] || [[ -f "$ppa_list" ]]; then
+        log "PPA уже добавлен."
+    else
+        mkdir -p "$keyring_dir"
+        log "Импорт GPG ключа Amnezia PPA..."
+        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" \
+            | gpg --dearmor -o "$keyring_file" \
+            || die "Ошибка импорта GPG ключа Amnezia PPA."
+        chmod 644 "$keyring_file"
+
+        # Debian 12 использует traditional .list формат, Debian 13+ и Ubuntu 24.04+ — DEB822 .sources
+        if [[ "${OS_ID:-ubuntu}" == "debian" && "${OS_VERSION}" == "12" ]]; then
+            log "Debian 12: используем традиционный формат .list"
+            echo "deb [signed-by=${keyring_file}] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu ${ppa_codename} main" \
+                > "$ppa_list" || die "Ошибка создания $ppa_list"
+            chmod 644 "$ppa_list"
+        else
+            cat > "$ppa_sources" <<PPASRC || die "Ошибка создания sources PPA."
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
+Suites: ${ppa_codename}
+Components: main
+Signed-By: ${keyring_file}
+PPASRC
+            chmod 644 "$ppa_sources"
+        fi
+        log "PPA добавлен."
+    fi
+    apt update -y || die "Ошибка apt update."
+
+    # Пакеты AmneziaWG + qrencode + Python3
+    log "Установка пакетов AmneziaWG..."
+    local packages=("amneziawg-dkms" "amneziawg-tools" "wireguard-tools" "dkms"
+                    "build-essential" "dpkg-dev" "qrencode" "python3" "python3-venv")
+
+    # Linux headers: на Debian может не быть точного linux-headers-$(uname -r)
+    local current_headers
+    current_headers="linux-headers-$(uname -r)"
+    if dpkg -s "$current_headers" &>/dev/null || apt-cache show "$current_headers" &>/dev/null 2>&1; then
+        packages+=("$current_headers")
+    else
+        log_warn "Нет headers для $(uname -r), установка общего пакета..."
+        if [[ "${OS_ID:-ubuntu}" == "debian" ]]; then
+            # На Debian: linux-headers-amd64 (или linux-headers-$(dpkg --print-architecture))
+            local arch_pkg
+            arch_pkg="linux-headers-$(dpkg --print-architecture 2>/dev/null || echo "amd64")"
+            packages+=("$arch_pkg")
+        else
+            packages+=("linux-headers-generic")
+        fi
+    fi
+    install_packages "${packages[@]}"
+
+    # DKMS статус
+    log "Проверка статуса DKMS..."
+    local dkms_stat
+    dkms_stat=$(dkms status 2>&1)
+    if ! echo "$dkms_stat" | grep -q 'amneziawg.*installed'; then
+        log_warn "DKMS статус не OK."
+        log_msg "WARN" "$dkms_stat"
+    else
+        log "DKMS статус OK."
+    fi
+
+    log "Шаг 2 завершен."
+    request_reboot 3
+}
+
+# ==============================================================================
+# ШАГ 3: Проверка модуля ядра
+# ==============================================================================
+
+step3_check_module() {
+    update_state 3
+    log "### ШАГ 3: Проверка модуля ядра ###"
+    sleep 2
+
+    if ! lsmod | grep -q -w amneziawg; then
+        log "Модуль не загружен. Загрузка..."
+        modprobe amneziawg || die "Ошибка modprobe amneziawg."
+        log "Модуль загружен."
+        local mf="/etc/modules-load.d/amneziawg.conf"
+        mkdir -p "$(dirname "$mf")"
+        if ! grep -qxF 'amneziawg' "$mf" 2>/dev/null; then
+            echo "amneziawg" > "$mf" || log_warn "Ошибка записи $mf"
+            log "Добавлено в $mf."
+        fi
+    else
+        log "Модуль amneziawg загружен."
+    fi
+
+    log "Информация о модуле:"
+    modinfo amneziawg | grep -E "filename|version|vermagic|srcversion" | while IFS= read -r line; do
+        log "  $line"
+    done
+
+    local cv kr
+    cv=$(modinfo amneziawg 2>/dev/null | grep vermagic | awk '{print $2}') || cv="?"
+    kr=$(uname -r)
+    if [[ "$cv" != "$kr" ]]; then
+        log_warn "VerMagic НЕ совпадает: Модуль($cv) != Ядро($kr)!"
+    else
+        log "VerMagic совпадает."
+    fi
+
+    # Проверка версии awg
+    if command -v awg &>/dev/null; then
+        local awg_ver
+        awg_ver=$(awg --version 2>/dev/null || echo "неизвестна")
+        log "Версия awg: $awg_ver"
+    else
+        log_warn "Команда awg не найдена!"
+    fi
+
+    log "Шаг 3 завершен."
+    update_state 4
+}
+
+# ==============================================================================
+# ШАГ 4: Настройка фаервола
+# ==============================================================================
+
+step4_setup_firewall() {
+    update_state 4
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        log "### ШАГ 4: Настройка фаервола UFW ###"
+        install_packages ufw
+        setup_improved_firewall || die "Ошибка настройки UFW."
+        log "Шаг 4 завершен."
+    else
+        log "### ШАГ 4: Пропуск настройки UFW (--no-tweaks) ###"
+    fi
+    update_state 5
+}
+
+# ==============================================================================
+# ШАГ 5: Скачивание скриптов
+# ==============================================================================
+
+step5_download_scripts() {
+    update_state 5
+    log "### ШАГ 5: Скачивание скриптов управления ###"
+    cd "$AWG_DIR" || die "Ошибка перехода в $AWG_DIR"
+
+    # Скачивание awg_common.sh
+    log "Скачивание $COMMON_SCRIPT_PATH..."
+    if curl -fLso "$COMMON_SCRIPT_PATH" --max-time 60 --retry 2 "$COMMON_SCRIPT_URL"; then
+        chmod 700 "$COMMON_SCRIPT_PATH" || die "Ошибка chmod awg_common.sh"
+        log "awg_common.sh скачан."
+    else
+        die "Ошибка скачивания awg_common.sh"
+    fi
+
+    # Скачивание manage_amneziawg.sh
+    log "Скачивание $MANAGE_SCRIPT_PATH..."
+    if curl -fLso "$MANAGE_SCRIPT_PATH" --max-time 60 --retry 2 "$MANAGE_SCRIPT_URL"; then
+        chmod 700 "$MANAGE_SCRIPT_PATH" || die "Ошибка chmod manage_amneziawg.sh"
+        log "manage_amneziawg.sh скачан."
+    else
+        die "Ошибка скачивания manage_amneziawg.sh"
+    fi
+
+    log "Шаг 5 завершен."
+    update_state 6
+}
+
+# ==============================================================================
+# ШАГ 6: Генерация конфигураций (нативная, без awgcfg.py)
+# ==============================================================================
+
+step6_generate_configs() {
+    update_state 6
+    log "### ШАГ 6: Генерация конфигураций AWG 2.0 ###"
+    cd "$AWG_DIR" || die "Ошибка cd $AWG_DIR"
+
+    # Подключаем общую библиотеку
+    if [[ ! -f "$COMMON_SCRIPT_PATH" ]]; then
+        die "awg_common.sh не найден. Шаг 5 не выполнен?"
+    fi
+    # shellcheck source=/dev/null
+    source "$COMMON_SCRIPT_PATH"
+
+    # Создаём директорию для ключей
+    mkdir -p "$KEYS_DIR" || die "Ошибка создания $KEYS_DIR"
+
+    # Генерация серверных ключей (если ещё нет)
+    if [[ ! -f "$AWG_DIR/server_private.key" ]]; then
+        log "Генерация серверных ключей..."
+        generate_server_keys || die "Ошибка генерации серверных ключей."
+    else
+        log "Серверные ключи уже существуют."
+    fi
+
+    # Бэкап существующего серверного конфига ДО перезаписи
+    if [[ -f "$SERVER_CONF_FILE" ]]; then
+        local s_bak
+        s_bak="${SERVER_CONF_FILE}.bak-$(date +%F_%H%M%S)"
+        cp "$SERVER_CONF_FILE" "$s_bak" || log_warn "Ошибка бэкапа $s_bak"
+        log "Бэкап серверного конфига: $s_bak"
+    fi
+
+    # Создание серверного конфига AWG 2.0
+    log "Создание серверного конфига..."
+    render_server_config || die "Ошибка создания серверного конфига."
+
+    # Восстановление существующих [Peer] блоков из бэкапа (кроме дефолтных)
+    if [[ -n "${s_bak:-}" && -f "$s_bak" ]]; then
+        local restored_peers
+        restored_peers=$(awk '
+            /^\[Peer\]/ { buf=$0"\n"; in_peer=1; skip=0; next }
+            in_peer && /^\[/ { if (!skip) printf "%s\n", buf; buf=""; in_peer=0; next }
+            in_peer { buf=buf $0"\n"; if ($0 ~ /^#_Name = (my_phone|my_laptop)$/) skip=1; next }
+            END { if (in_peer && !skip) printf "%s", buf }
+        ' "$s_bak")
+        if [[ -n "$restored_peers" ]]; then
+            printf '\n%s' "$restored_peers" >> "$SERVER_CONF_FILE"
+            log "Существующие пиры восстановлены из бэкапа."
+        fi
+    fi
+
+    # Генерация клиентов по умолчанию
+    log "Создание клиентов по умолчанию..."
+    local client_name
+    for client_name in my_phone my_laptop; do
+        if grep -qxF "#_Name = ${client_name}" "$SERVER_CONF_FILE" 2>/dev/null; then
+            log "Клиент '$client_name' уже существует."
+        else
+            log "Создание клиента '$client_name'..."
+            generate_client "$client_name" || log_warn "Ошибка создания клиента '$client_name'"
+        fi
+    done
+
+    # Валидация конфига
+    validate_awg_config || log_warn "Валидация конфига выявила проблемы."
+
+    # Установка прав доступа
+    secure_files
+
+    log "Конфигурационные файлы в $AWG_DIR:"
+    ls -la "$AWG_DIR"/*.conf "$AWG_DIR"/*.png 2>/dev/null | while IFS= read -r line; do
+        log "  $line"
+    done
+
+    log "Шаг 6 завершен."
+    update_state 7
+}
+
+# ==============================================================================
+# ШАГ 7: Запуск сервиса
+# ==============================================================================
+
+step7_start_service() {
+    update_state 7
+    log "### ШАГ 7: Запуск сервиса и настройка безопасности ###"
+
+    log "Включение и запуск awg-quick@awg0..."
+    systemctl enable --now awg-quick@awg0 || die "Ошибка enable --now."
+    log "Сервис включен и запущен."
+
+    log "Проверка статуса сервиса..."
+    local _attempt
+    for _attempt in 1 2 3 4 5; do
+        sleep 1
+        check_service_status 2>/dev/null && break
+        [[ $_attempt -lt 5 ]] && log_debug "Ожидание запуска сервиса... (попытка $_attempt/5)"
+    done
+    check_service_status || die "Проверка статуса сервиса не пройдена."
+
+    # Fail2Ban
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_fail2ban
+    else
+        log "Пропуск Fail2Ban (--no-tweaks)."
+    fi
+
+    log "Шаг 7 успешно завершен."
+    update_state 99
+}
+
+# ==============================================================================
+# ШАГ 99: Завершение
+# ==============================================================================
+
+step99_finish() {
+    log "### ЗАВЕРШЕНИЕ УСТАНОВКИ ###"
+    log "=============================================================================="
+    log "Установка и настройка AmneziaWG 2.0 УСПЕШНО ЗАВЕРШЕНА!"
+    log " "
+    log "КЛИЕНТСКИЕ ФАЙЛЫ:"
+    log "  Конфиги (.conf) и QR-коды (.png) в: $AWG_DIR"
+    log "  Скопируйте их безопасным способом."
+    log "  Пример (на вашем ПК):"
+    log "    scp root@<IP_СЕРВЕРА>:$AWG_DIR/*.conf ./"
+    log " "
+    log "ПОЛЕЗНЫЕ КОМАНДЫ:"
+    log "  sudo bash $MANAGE_SCRIPT_PATH help   # Управление клиентами"
+    log "  systemctl status awg-quick@awg0      # Статус VPN"
+    log "  awg show                              # Статус AmneziaWG"
+    log "  ufw status verbose                    # Статус Firewall"
+    log " "
+    log "ВАЖНО: Для подключения используйте клиент Amnezia VPN >= 4.8.12.7"
+    log "       с поддержкой протокола AWG 2.0"
+    log " "
+    cleanup_apt
+    log " "
+
+    # Финальные проверки
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log "Файл настроек $CONFIG_FILE: OK"
+    else
+        log_error "Файл настроек $CONFIG_FILE ОТСУТСТВУЕТ!"
+    fi
+
+    # Удаление файла состояния
+    log "Удаление файла состояния установки..."
+    rm -f "$STATE_FILE" "${STATE_FILE}.lock" || log_warn "Не удалось удалить $STATE_FILE"
+    log "Установка полностью завершена. Лог: $LOG_FILE"
+    log "=============================================================================="
+}
+
+# ==============================================================================
+# Основной цикл выполнения
+# ==============================================================================
+
+if [[ "$HELP" -eq 1 ]]; then show_help; fi
+if [[ "$UNINSTALL" -eq 1 ]]; then step_uninstall; fi
+if [[ "$DIAGNOSTIC" -eq 1 ]]; then create_diagnostic_report; exit 0; fi
+if [[ "$VERBOSE" -eq 1 ]]; then set -x; fi
+
+initialize_setup
+
+while (( current_step < 99 )); do
+    log "Выполнение шага $current_step..."
+    case $current_step in
+        1) step1_update_and_optimize ;;
+        2) step2_install_amnezia ;;
+        3) step3_check_module; current_step=4 ;;
+        4) step4_setup_firewall; current_step=5 ;;
+        5) step5_download_scripts; current_step=6 ;;
+        6) step6_generate_configs; current_step=7 ;;
+        7) step7_start_service; current_step=99 ;;
+        *) die "Ошибка: Неизвестный шаг $current_step." ;;
+    esac
+done
+
+if (( current_step == 99 )); then step99_finish; fi
+exit 0
