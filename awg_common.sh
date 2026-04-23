@@ -428,9 +428,22 @@ render_server_config() {
     postup="${postup}; bash ${man_script} apply-limits 2>/dev/null || true"
     postdown="${postdown}; bash ${man_script} clear-limits 2>/dev/null || true"
 
+    local is_warp_active=0
     if [[ "${USE_WARP:-0}" == "1" ]]; then
+        is_warp_active=1
+    elif [[ -f "$SERVER_CONF_FILE" ]] && grep -q "^#_UseWarp = 1" "$SERVER_CONF_FILE"; then
+        is_warp_active=1
+    fi
+
+    if [[ "$is_warp_active" -eq 1 ]]; then
         postup="${postup}; bash ${man_script} apply-warp-routing 2>/dev/null || true"
         postdown="${postdown}; bash ${man_script} clear-warp-routing 2>/dev/null || true"
+    fi
+
+    # Сохраняем существующие секции [Peer]
+    local peers_part=""
+    if [[ -f "$SERVER_CONF_FILE" ]]; then
+        peers_part=$(sed -n '/^\[Peer\]/,$p' "$SERVER_CONF_FILE" 2>/dev/null)
     fi
 
     # Формируем конфиг через временный файл (атомарная запись)
@@ -463,13 +476,19 @@ EOF
         echo "I1 = ${AWG_I1}" >> "$tmpfile"
     fi
 
+    # Добавляем пиров обратно
+    if [[ -n "$peers_part" ]]; then
+        echo "" >> "$tmpfile"
+        echo "$peers_part" >> "$tmpfile"
+    fi
+
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Ошибка записи серверного конфига"
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
-    log "Серверный конфиг создан: $SERVER_CONF_FILE"
+    log "Серверный конфиг обновлен: $SERVER_CONF_FILE"
     return 0
 }
 

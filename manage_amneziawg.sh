@@ -145,6 +145,32 @@ escape_sed() {
     printf '%s' "$s"
 }
 
+# Проверка и временное исправление DNS (если pypi.org или api.cloudflareclient.com не резолвятся)
+check_and_fix_dns() {
+    log "Проверка DNS..."
+    if ! getent hosts google.com &>/dev/null && ! getent hosts api.cloudflareclient.com &>/dev/null; then
+        log_warn "DNS не работает. Попытка временного исправления..."
+        local rconf="/etc/resolv.conf"
+        if [[ -f "$rconf" ]]; then
+            # Проверяем, нет ли уже там 8.8.8.8
+            if ! grep -q "8.8.8.8" "$rconf"; then
+                echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" >> "$rconf"
+                log "Публичные DNS добавлены в $rconf"
+            fi
+        else
+            echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > "$rconf"
+            log "$rconf создан с публичными DNS"
+        fi
+
+        # Фикс для некоторых систем, где IPv6 приоритетнее, но не работает
+        if [[ -f /etc/sysctl.d/99-amneziawg-security.conf ]]; then
+             sysctl -p /etc/sysctl.d/99-amneziawg-security.conf >/dev/null 2>&1
+        fi
+    else
+        log_debug "DNS работает корректно."
+    fi
+}
+
 confirm_action() {
     if ! is_interactive; then return 0; fi
     local action="$1" subject="$2"
@@ -545,6 +571,7 @@ install_wgcf() {
 }
 
 setup_warp_config() {
+    check_and_fix_dns
     install_wgcf
     
     local td
@@ -553,13 +580,14 @@ setup_warp_config() {
 
     log "Регистрация аккаунта Cloudflare WARP..."
     # wgcf register создаёт wgcf-account.toml
-    if ! "$WGCF_PATH" --config "$td/wgcf-account.toml" register --accept-tos; then
+    # Используем GODEBUG=netdns=go для обхода проблем с DNS i/o timeout
+    if ! GODEBUG=netdns=go "$WGCF_PATH" --config "$td/wgcf-account.toml" register --accept-tos; then
         die "Ошибка регистрации WARP."
     fi
 
     log "Генерация конфигурации WireGuard..."
     # wgcf generate создаёт wgcf-profile.conf
-    if ! "$WGCF_PATH" --config "$td/wgcf-account.toml" generate; then
+    if ! GODEBUG=netdns=go "$WGCF_PATH" --config "$td/wgcf-account.toml" generate; then
         die "Ошибка генерации профиля WARP."
     fi
 
@@ -609,22 +637,163 @@ apply_warp_routing() {
     # Создание таблицы и маршрутов
     ip route replace default dev wg-warp table "$WARP_TABLE" 2>/dev/null || \
         ip route add default dev wg-warp table "$WARP_TABLE" 2>/dev/null
-    
-    # Правило для подсети AmneziaWG
-    ip rule del from "$subnet" table "$WARP_TABLE" 2>/dev/null
-    ip rule add from "$subnet" table "$WARP_TABLE"
+
+    # 1. Глобальная настройка (если включено в конфиге)
+    # Проверяем состояние USE_WARP из конфига
+    local global_warp=0
+    [[ -f "$CONFIG_FILE" ]] && grep -q "USE_WARP=1" "$CONFIG_FILE" && global_warp=1
+
+    if [[ "$global_warp" -eq 1 ]]; then
+        ip rule del from "$subnet" table "$WARP_TABLE" 2>/dev/null
+        ip rule add from "$subnet" table "$WARP_TABLE"
+        log "Маршрутизация через WARP активна для всей подсети $subnet"
+    fi
+
+    # 2. Индивидуальная настройка для пользователей
+    local _cname="" _ip="" _use_warp_flag=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "#_Name = "* ]]; then
+            _cname="${line#\#_Name = }"
+            _use_warp_flag=0
+        elif [[ "$line" == "#_UseWarp = 1" ]]; then
+            _use_warp_flag=1
+        elif [[ "$line" == "AllowedIPs = "* ]]; then
+            _ip="${line#AllowedIPs = }"
+            _ip="${_ip%%/*}"; _ip="${_ip## }"; _ip="${_ip%% }"
+            
+            if [[ "$_use_warp_flag" -eq 1 ]]; then
+                # Если глобальный WARP уже включен для всей подсети, индивидуальное правило избыточно,
+                # но добавим его для надежности (оно будет иметь высший приоритет).
+                ip rule del from "$_ip" table "$WARP_TABLE" 2>/dev/null
+                ip rule add from "$_ip" table "$WARP_TABLE"
+                log "WARP активен для пользователя $_cname ($_ip)"
+            elif [[ "$global_warp" -eq 0 ]]; then
+                # Очищаем индивидуальное правило, если оно было
+                ip rule del from "$_ip" table "$WARP_TABLE" 2>/dev/null
+            fi
+            _use_warp_flag=0
+        fi
+    done < "$SERVER_CONF_FILE"
     
     # Очистка кэша маршрутов
     ip route flush cache
-    log "Маршрутизация через WARP активна для $subnet"
 }
 
 clear_warp_routing() {
     log "Очистка маршрутизации WARP..."
     local subnet="${AWG_TUNNEL_SUBNET:-10.9.9.0/24}"
+    
+    # Удаляем правило для всей подсети
     ip rule del from "$subnet" table "$WARP_TABLE" 2>/dev/null
+    
+    # Удаляем все индивидуальные правила, указывающие на таблицу WARP
+    # Это надежнее, чем искать пользователей по конфигу
+    while read -r rule; do
+        local from_ip
+        from_ip=$(echo "$rule" | grep -oP "from \K[0-9./]+")
+        if [[ -n "$from_ip" ]]; then
+            ip rule del from "$from_ip" table "$WARP_TABLE" 2>/dev/null
+        fi
+    done < <(ip rule show | grep "lookup $WARP_TABLE")
+
     ip route flush table "$WARP_TABLE" 2>/dev/null
     ip route flush cache
+}
+
+warp_user() {
+    local name="$1" action="$2"
+
+    if [[ -z "$name" || -z "$action" ]]; then
+        log_error "Использование: warp-user <имя> <on|off>"
+        return 1
+    fi
+
+    if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE"; then
+        die "Клиент '$name' не найден."
+    fi
+
+    log "Установка WARP для пользователя '$name' в состояние '$action'..."
+    
+    local bak
+    bak="${SERVER_CONF_FILE}.bak-$(date +%F_%H-%M-%S)"
+    cp "$SERVER_CONF_FILE" "$bak" || log_warn "Ошибка бэкапа $bak"
+
+    local td
+    td=$(manage_mktempdir) || die "Ошибка создания временной директории"
+    local tmpfile="$td/srv_mod.conf"
+    
+    awk -v target="$name" -v action="$action" '
+    BEGIN { in_target=0 }
+    /^\[Peer\]/ {
+        in_target=0
+        print
+        next
+    }
+    /^#_Name =/ {
+        print
+        if ($0 == "#_Name = " target) {
+            in_target=1
+            if (action == "on") print "#_UseWarp = 1"
+        }
+        next
+    }
+    /^#_UseWarp = 1/ {
+        if (!in_target) print
+        next
+    }
+    { print }
+    ' "$SERVER_CONF_FILE" > "$tmpfile"
+
+    if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
+        cp "$bak" "$SERVER_CONF_FILE"
+        die "Ошибка обновления файла конфигурации."
+    fi
+    rm -f "$bak"
+
+    log "Настройка пользователя '$name' завершена."
+
+    # Если действие "on", нам нужно убедиться, что интерфейс wg-warp поднят
+    if [[ "$action" == "on" ]]; then
+        _manage_warp_service on
+        apply_warp_routing
+    else
+        # Если "off", просто переприменяем правила (они очистятся в apply_warp_routing)
+        apply_warp_routing
+        
+        # Проверяем, остались ли еще пользователи с WARP или глобальный WARP
+        local remaining_warp=0
+        if [[ -f "$CONFIG_FILE" ]] && grep -q "USE_WARP=1" "$CONFIG_FILE"; then
+            remaining_warp=1
+        elif grep -q "^#_UseWarp = 1" "$SERVER_CONF_FILE"; then
+            remaining_warp=1
+        fi
+        
+        if [[ "$remaining_warp" -eq 0 ]]; then
+            log "Пользователей с WARP больше нет, выключение интерфейса wg-warp..."
+            _manage_warp_service off
+        fi
+    fi
+}
+
+_manage_warp_service() {
+    local action="$1"
+    case "$action" in
+        on)
+            if ! systemctl is-active --quiet awg-quick@wg-warp; then
+                log "Запуск сервиса wg-warp..."
+                systemctl enable awg-quick@wg-warp 2>/dev/null
+                if ! systemctl start awg-quick@wg-warp; then
+                    log_error "Не удалось запустить интерфейс wg-warp."
+                    return 1
+                fi
+            fi
+            ;;
+        off)
+            log "Остановка сервиса wg-warp..."
+            systemctl stop awg-quick@wg-warp 2>/dev/null
+            systemctl disable awg-quick@wg-warp 2>/dev/null
+            ;;
+    esac
 }
 
 manage_warp() {
@@ -632,6 +801,15 @@ manage_warp() {
     case "$cmd" in
         install)
             setup_warp_config
+            ;;
+        regen)
+            log "Принудительная перегенерация конфигурации WARP..."
+            setup_warp_config
+            if systemctl is-active --quiet awg-quick@wg-warp; then
+                log "Перезапуск интерфейса wg-warp..."
+                systemctl restart awg-quick@wg-warp
+                apply_warp_routing
+            fi
             ;;
         on)
             if [[ ! -f "$WARP_CONF" ]]; then
@@ -647,40 +825,38 @@ manage_warp() {
                 fi
             fi
 
-            log "Включение WARP..."
-            systemctl enable awg-quick@wg-warp 2>/dev/null
-            if systemctl start awg-quick@wg-warp; then
-                # Сохраняем состояние ПЕРЕД render_server_config
-                sed -i '/^USE_WARP=/d' "$CONFIG_FILE"
-                echo "USE_WARP=1" >> "$CONFIG_FILE"
-                
-                # Обновляем awg0.conf, чтобы PostUp правила были постоянными
-                render_server_config
-                
-                apply_warp_routing
-                log "WARP включен."
-            else
-                log_error "Не удалось запустить интерфейс wg-warp."
-                return 1
-            fi
+            log "Включение глобального WARP..."
+            sed -i '/^USE_WARP=/d' "$CONFIG_FILE"
+            echo "USE_WARP=1" >> "$CONFIG_FILE"
+            
+            # Обновляем awg0.conf, чтобы PostUp правила были постоянными
+            render_server_config
+            
+            _manage_warp_service on
+            apply_warp_routing
+            log "Глобальный WARP включен."
             ;;
         off)
-            log "Выключение WARP..."
-            clear_warp_routing
-            systemctl stop awg-quick@wg-warp 2>/dev/null
-            systemctl disable awg-quick@wg-warp 2>/dev/null
-            
+            log "Выключение глобального WARP..."
             sed -i '/^USE_WARP=/d' "$CONFIG_FILE"
             echo "USE_WARP=0" >> "$CONFIG_FILE"
             
-            # Обновляем awg0.conf, чтобы убрать PostUp правила WARP
+            # Обновляем awg0.conf, чтобы убрать PostUp правила WARP (если нет индивидуальных)
             render_server_config
             
-            log "WARP выключен."
+            apply_warp_routing
+            
+            # Останавливаем сервис только если нет индивидуальных пользователей
+            local has_indiv
+            has_indiv=$(grep -c "^#_UseWarp = 1" "$SERVER_CONF_FILE")
+            if [[ "$has_indiv" -eq 0 ]]; then
+                _manage_warp_service off
+            fi
+            log "Глобальный WARP выключен."
             ;;
         status)
             if systemctl is-active --quiet awg-quick@wg-warp; then
-                log "WARP статус: Активен (Интерфейс подняты)"
+                log "WARP статус: Активен (Интерфейс поднят)"
                 if ip rule show | grep -q "table $WARP_TABLE"; then
                     log "Маршрутизация: Включена"
                 else
@@ -690,15 +866,88 @@ manage_warp() {
                 local wg_ip
                 wg_ip=$(curl -4 -s --max-time 5 --interface wg-warp https://api.ipify.org 2>/dev/null)
                 log "Внешний IP через WARP: ${wg_ip:-неизвестно}"
+                
+                local endpoint
+                endpoint=$(grep "^Endpoint =" "$WARP_CONF" 2>/dev/null | cut -d' ' -f3)
+                [[ -n "$endpoint" ]] && log "Текущий Endpoint: $endpoint"
+
+                # Показываем индивидуальных пользователей
+                local warp_users
+                warp_users=$(grep -B 1 "^#_UseWarp = 1" "$SERVER_CONF_FILE" | grep "^#_Name =" | sed 's/^#_Name = //' | tr '\n' ' ')
+                if [[ -n "$warp_users" ]]; then
+                     log "Пользователи с WARP: $warp_users"
+                elif [[ ! -f "$CONFIG_FILE" || "$(grep -c "USE_WARP=1" "$CONFIG_FILE")" -eq 0 ]]; then
+                     log "Индивидуальных пользователей с WARP нет."
+                fi
             else
                 log "WARP статус: Отключен"
             fi
             ;;
+        endpoint)
+            local ep="$2"
+            if [[ -z "$ep" ]]; then
+                log_error "Использование: warp endpoint <IP:PORT>"
+                return 1
+            fi
+            set_warp_endpoint "$ep"
+            ;;
+        optimize-ip)
+            optimize_warp_ip
+            ;;
         *)
-            log_error "Использование: warp <install|on|off|status>"
+            log_error "Использование: warp <install|on|off|status|regen|endpoint|optimize-ip>"
             return 1
             ;;
     esac
+}
+
+set_warp_endpoint() {
+    local endpoint="$1"
+    if [[ ! -f "$WARP_CONF" ]]; then
+        log_error "Конфиг WARP не найден. Сначала выполните 'warp install'."
+        return 1
+    fi
+    
+    log "Установка эндпоинта WARP: $endpoint..."
+    sed -i "s|^Endpoint = .*|Endpoint = $endpoint|" "$WARP_CONF"
+    
+    if systemctl is-active --quiet awg-quick@wg-warp; then
+        log "Применение настроек (restart wg-warp)..."
+        systemctl restart awg-quick@wg-warp
+        apply_warp_routing
+    fi
+    log "Эндпоинт успешно изменен."
+}
+
+optimize_warp_ip() {
+    log "Поиск оптимального IP Cloudflare (Anycast)..."
+    local ips=(
+        "162.159.192.1" "162.159.192.5" "162.159.193.1" "162.159.193.5"
+        "162.159.195.1" "162.159.195.5" "188.114.96.1" "188.114.97.1"
+        "188.114.98.1" "188.114.99.1"
+    )
+    local best_ip=""
+    local min_avg=9999
+    
+    for ip in "${ips[@]}"; do
+        local res
+        res=$(ping -c 3 -W 1 -q "$ip" 2>/dev/null | grep rtt | cut -d'/' -f5)
+        if [[ -n "$res" ]]; then
+            log "  IP $ip: ${res}ms"
+            # Сравнение с плавающей точкой через awk
+            if [[ $(awk -v r="$res" -v m="$min_avg" 'BEGIN {print (r < m)}') -eq 1 ]]; then
+                min_avg=$res
+                best_ip=$ip
+            fi
+        fi
+    done
+    
+    if [[ -n "$best_ip" ]]; then
+        log "Найден лучший IP: $best_ip (задержка ${min_avg}ms)"
+        set_warp_endpoint "${best_ip}:2408"
+    else
+        log_error "Не удалось найти доступные IP для настройки."
+    fi
 }
 
 # ==============================================================================
@@ -896,7 +1145,7 @@ async def cb_client_options(callback: types.CallbackQuery):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 Конфиг", callback_data=f"get:conf:{idx}"), InlineKeyboardButton(text="🖼 QR-код", callback_data=f"get:qr:{idx}")],
-        [InlineKeyboardButton(text="⚡️ Лимит скорости", callback_data=f"limit_menu:{idx}")],
+        [InlineKeyboardButton(text="⚡️ Лимит скорости", callback_data=f"limit_menu:{idx}"), InlineKeyboardButton(text="🌍 WARP", callback_data=f"warp_menu:{idx}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_conf:{idx}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="options_list")]
     ])
@@ -940,6 +1189,26 @@ async def cb_set_limit(callback: types.CallbackQuery):
     name = get_name_by_idx(idx)
     run_cmd(["limit", name, val, val])
     await callback.answer(f"Лимит {val} Мбит установлен")
+    await cb_client_options(callback)
+
+@dp.callback_query(F.data.startswith("warp_menu:"))
+async def cb_warp_menu(callback: types.CallbackQuery):
+    idx = callback.data.split(":")[1]
+    name = get_name_by_idx(idx)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Включить", callback_data=f"setwarp:{idx}:on"), InlineKeyboardButton(text="⏹ Выключить", callback_data=f"setwarp:{idx}:off")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"client:{idx}")]
+    ])
+    await callback.message.edit_text(f"🌍 Управление WARP для <b>{name}</b>:", reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("setwarp:"))
+async def cb_set_warp(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    idx, val = parts[1], parts[2]
+    name = get_name_by_idx(idx)
+    run_cmd(["warp-user", name, val])
+    await callback.answer(f"WARP для {name} {'включен' if val=='on' else 'выключен'}")
     await cb_client_options(callback)
 
 @dp.callback_query(F.data.startswith("del_conf:"))
@@ -1536,7 +1805,8 @@ usage() {
     echo "  regen [имя]           Перегенерировать файлы клиента(ов)"
     echo "  modify <имя> <пар> <зн> Изменить параметр клиента"
     echo "  limit <имя> <down> [up] Установить лимит скорости в Мбит/с (0 - снять)"
-    echo "  warp <install|on|off|status> Управление Cloudflare WARP"
+    echo "  warp <install|on|off|status|regen|endpoint|optimize-ip> Управление WARP"
+    echo "  warp-user <имя> <on|off> Включить/выключить WARP для клиента"
     echo "  bot <on|off|status>   Управление Telegram-ботом"
     echo "  backup                Создать бэкап"
     echo "  restore [файл]        Восстановить из бэкапа"
@@ -1548,31 +1818,7 @@ usage() {
     return 1
 }
 
-# Проверка и временное исправление DNS (если pypi.org не резолвится)
-check_and_fix_dns() {
-    log "Проверка DNS..."
-    if ! getent hosts pypi.org &>/dev/null && ! getent hosts google.com &>/dev/null; then
-        log_warn "DNS не работает. Попытка временного исправления..."
-        local rconf="/etc/resolv.conf"
-        if [[ -f "$rconf" ]]; then
-            # Проверяем, нет ли уже там 8.8.8.8
-            if ! grep -q "8.8.8.8" "$rconf"; then
-                echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" >> "$rconf"
-                log "Публичные DNS добавлены в $rconf"
-            fi
-        else
-            echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > "$rconf"
-            log "$rconf создан с публичными DNS"
-        fi
-        
-        # Фикс для некоторых систем, где IPv6 приоритетнее, но не работает
-        if [[ -f /etc/sysctl.d/99-amneziawg-security.conf ]]; then
-             sysctl -p /etc/sysctl.d/99-amneziawg-security.conf >/dev/null 2>&1
-        fi
-    else
-        log "DNS работает корректно."
-    fi
-}
+# (Функция check_and_fix_dns перемещена выше для доступности)
 
 # ==============================================================================
 # Основная логика
@@ -1768,6 +2014,12 @@ case $COMMAND in
 
     warp)
         manage_warp "$CLIENT_NAME" || _cmd_rc=1 # CLIENT_NAME здесь это подкоманда warp
+        ;;
+
+    warp-user)
+        [[ -z "$CLIENT_NAME" ]] && die "Не указано имя клиента."
+        validate_client_name "$CLIENT_NAME" || exit 1
+        warp_user "$CLIENT_NAME" "$PARAM" || _cmd_rc=1
         ;;
 
     bot)
